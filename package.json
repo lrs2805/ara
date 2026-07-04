@@ -1,0 +1,35 @@
+{
+  "name": "ara",
+  "version": "0.1.0",
+  "description": "AI Meeting Avatar — autonomous voice agent for Daily.co rooms",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "lint": "eslint src/",
+    "test:vad": "tsx src/scripts/test-vad.ts",
+    "test:realtime": "tsx src/scripts/test-realtime.ts",
+    "validate": "tsx src/scripts/validate.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "avr-vad": "^1.0.8",
+    "dotenv": "^16.5.0",
+    "puppeteer-core": "^24.8.2",
+    "ws": "^8.18.2",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.26.0",
+    "@types/node": "^22.14.1",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.26.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.32.0"
+  }
+}

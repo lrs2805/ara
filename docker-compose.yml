@@ -1,0 +1,12 @@
+services:
+  ara:
+    build: .
+    env_file: .env
+    shm_size: "1g"
+    restart: unless-stopped
+    volumes:
+      - ./public:/app/public:ro
+      - ara-debug:/tmp/ara-debug
+
+volumes:
+  ara-debug:
