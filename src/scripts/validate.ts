@@ -53,8 +53,10 @@ async function main(): Promise<void> {
       client.on("connected", () => {
         clearTimeout(timeout);
         console.log("[validate] OpenAI Realtime connected");
-        client.destroy();
-        resolve();
+        setTimeout(() => {
+          client.destroy();
+          resolve();
+        }, 500);
       });
       client.on("error", reject);
       client.connect().catch(reject);

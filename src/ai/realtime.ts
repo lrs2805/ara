@@ -5,8 +5,8 @@ import {
   OPENAI_TIMEOUT_MS,
 } from "../config/types.js";
 
-const REALTIME_URL =
-  "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
+const REALTIME_MODEL = "gpt-realtime";
+const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
 
 export interface RealtimeEvents {
   audioDelta: (pcm24k: Buffer) => void;
@@ -57,7 +57,6 @@ export class RealtimeClient extends EventEmitter {
       this.ws = new WebSocket(REALTIME_URL, {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
-          "OpenAI-Beta": "realtime=v1",
         },
       });
 
@@ -93,13 +92,20 @@ export class RealtimeClient extends EventEmitter {
     this.send({
       type: "session.update",
       session: {
-        modalities: ["text", "audio"],
+        type: "realtime",
+        model: REALTIME_MODEL,
+        output_modalities: ["audio"],
         instructions: this.instructions,
-        voice: this.voice,
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        input_audio_transcription: { model: "whisper-1" },
-        turn_detection: null,
+        audio: {
+          input: {
+            format: { type: "audio/pcm", rate: 24000 },
+            turn_detection: null,
+          },
+          output: {
+            format: { type: "audio/pcm", rate: 24000 },
+            voice: this.voice,
+          },
+        },
       },
     });
   }
@@ -119,6 +125,7 @@ export class RealtimeClient extends EventEmitter {
         console.log("[OpenAI] session created");
         break;
 
+      case "response.output_audio.delta":
       case "response.audio.delta": {
         const delta = event.delta as string;
         if (delta) {
@@ -128,6 +135,7 @@ export class RealtimeClient extends EventEmitter {
       }
 
       case "response.done":
+      case "response.completed":
         this.clearResponseTimer();
         this.emit("responseDone");
         break;
