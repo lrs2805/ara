@@ -37,6 +37,9 @@ Daily Room → Puppeteer/daily-js → Audio Bridge → VAD (Silero) → GPT-4o R
 npm run dev          # Start with hot reload
 npm run build        # Compile TypeScript
 npm start            # Run compiled build
+npm test             # Unit tests (Vitest)
+npm run lint         # ESLint
+npm run validate     # Smoke-load modules (+ optional API check)
 npm run test:vad     # Test VAD in isolation
 npm run test:realtime # Test OpenAI Realtime API
 ```
@@ -55,7 +58,7 @@ Requires `.env` file with API keys.
 IDLE → LISTENING → PROCESSING → SPEAKING → LISTENING
                   ↘ ERROR → LISTENING
 SPEAKING + interruption → LISTENING
-* → HANDOFF → LISTENING (stub)
+* → HANDOFF → LISTENING (stub transfer; triggered by user ASR keywords)
 ```
 
 ## Validation Test

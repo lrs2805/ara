@@ -10,10 +10,12 @@ export const PersonalityToneSchema = z.enum([
 export const AraConfigSchema = z.object({
   name: z.string().default("ARA"),
   voice: z.string().default("alloy"),
-  personality: z.object({
-    tone: PersonalityToneSchema.default("consultivo"),
-    speed: z.number().min(0.5).max(2).default(1.0),
-  }),
+  personality: z
+    .object({
+      tone: PersonalityToneSchema.default("consultivo"),
+      speed: z.number().min(0.5).max(2).default(1.0),
+    })
+    .default({ tone: "consultivo", speed: 1.0 }),
   pitch: z.object({
     opening: z.string(),
     valueProposition: z.string(),
@@ -50,7 +52,6 @@ export const SAMPLE_RATES = {
   openai: 24000,
 } as const;
 
-export const BUFFER_MS = 50;
 export const VAD_SILENCE_MS = 1500;
 export const SPEAKING_TIMEOUT_MS = 60_000;
 /** Time-to-first-audio timeout — cleared when first audio delta arrives. */
@@ -58,3 +59,8 @@ export const OPENAI_TTFT_TIMEOUT_MS = 10_000;
 /** Absolute max for a single model response stream. */
 export const OPENAI_RESPONSE_TIMEOUT_MS = 60_000;
 export const OPENAI_RECONNECT_MS = 55 * 60 * 1000;
+
+/** Validate and normalize ARA runtime config (fails closed on bad input). */
+export function parseAraConfig(input: unknown): AraConfig {
+  return AraConfigSchema.parse(input);
+}

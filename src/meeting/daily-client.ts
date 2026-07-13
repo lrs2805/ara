@@ -95,11 +95,16 @@ export class DailyClient extends EventEmitter {
         });
         console.log("[Daily] meeting token created");
       } catch (err) {
-        console.warn(
-          "[Daily] meeting token failed (joining without token):",
-          err instanceof Error ? err.message : err,
+        const message =
+          err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Daily meeting token required but creation failed: ${message}`,
         );
       }
+    } else {
+      console.warn(
+        "[Daily] no API key — joining without meeting token (dev only)",
+      );
     }
 
     // Close previous browser if reconnecting

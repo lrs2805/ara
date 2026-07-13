@@ -9,6 +9,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test:vad": "tsx src/scripts/test-vad.ts",
     "test:realtime": "tsx src/scripts/test-realtime.ts",
     "validate": "tsx src/scripts/validate.ts"
@@ -30,6 +32,7 @@
     "eslint": "^9.26.0",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3",
-    "typescript-eslint": "^8.32.0"
+    "typescript-eslint": "^8.32.0",
+    "vitest": "^3.1.3"
   }
 }

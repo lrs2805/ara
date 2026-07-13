@@ -12,6 +12,8 @@ const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
 export interface RealtimeEvents {
   audioDelta: (pcm24k: Buffer) => void;
   responseDone: () => void;
+  /** Final ASR of committed user audio (when input transcription is enabled). */
+  inputTranscript: (text: string) => void;
   error: (err: Error) => void;
   connected: () => void;
   disconnected: () => void;
@@ -110,6 +112,11 @@ export class RealtimeClient extends EventEmitter {
           input: {
             format: { type: "audio/pcm", rate: 24000 },
             turn_detection: null,
+            // Opt-in ASR so handoff can match spoken triggers on user turns.
+            transcription: {
+              model: "gpt-4o-mini-transcribe",
+              language: "pt",
+            },
           },
           output: {
             format: { type: "audio/pcm", rate: 24000 },
@@ -153,6 +160,19 @@ export class RealtimeClient extends EventEmitter {
         this.clearAllResponseTimers();
         this.emit("responseDone");
         break;
+
+      case "conversation.item.input_audio_transcription.completed": {
+        const transcript = event.transcript as string | undefined;
+        if (transcript?.trim()) {
+          this.emit("inputTranscript", transcript.trim());
+        }
+        break;
+      }
+
+      case "conversation.item.input_audio_transcription.failed": {
+        console.warn("[OpenAI] input transcription failed");
+        break;
+      }
 
       case "error": {
         const errObj = event.error as { message?: string; code?: string } | undefined;

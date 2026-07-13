@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { SAMPLE_RATES, BUFFER_MS } from "../config/types.js";
+import { SAMPLE_RATES } from "../config/types.js";
 import { resamplePcm16 } from "./resampler.js";
 import { VoiceActivityDetector } from "./vad.js";
 
@@ -23,22 +23,16 @@ export declare interface AudioBridge {
  * Input modes:
  * - listening: full VAD (speech start + end → utterance)
  * - speaking: VAD stays on for barge-in (speechStart only triggers interrupt upstream)
- * - muted: ignore remote audio (PROCESSING)
+ * - muted: ignore remote audio (PROCESSING / HANDOFF)
  */
 export type BridgeInputMode = "listening" | "speaking" | "muted";
 
 export class AudioBridge extends EventEmitter {
   private vad: VoiceActivityDetector;
-  private circularBuffer: Buffer[] = [];
-  private circularBufferBytes = 0;
-  private readonly maxBufferBytes: number;
   private mode: BridgeInputMode = "listening";
 
   constructor(options: { debugAudio?: boolean } = {}) {
     super();
-    this.maxBufferBytes = Math.ceil(
-      (SAMPLE_RATES.daily * 2 * BUFFER_MS) / 1000,
-    );
 
     this.vad = new VoiceActivityDetector({
       debugAudio: options.debugAudio,
@@ -65,8 +59,6 @@ export class AudioBridge extends EventEmitter {
   /** Receive PCM16 48kHz chunk from Daily browser bridge. */
   ingestRemoteAudio(pcm48k: Buffer): void {
     if (this.mode === "muted") return;
-
-    this.pushCircular(pcm48k);
     this.vad.process(pcm48k, SAMPLE_RATES.daily);
   }
 
@@ -77,12 +69,7 @@ export class AudioBridge extends EventEmitter {
 
   setInputMode(mode: BridgeInputMode): void {
     this.mode = mode;
-    const enabled = mode !== "muted";
-    this.vad.setEnabled(enabled);
-    if (!enabled) {
-      this.circularBuffer = [];
-      this.circularBufferBytes = 0;
-    }
+    this.vad.setEnabled(mode !== "muted");
   }
 
   /** @deprecated Prefer setInputMode */
@@ -93,17 +80,5 @@ export class AudioBridge extends EventEmitter {
   destroy(): void {
     this.vad.destroy();
     this.removeAllListeners();
-  }
-
-  private pushCircular(chunk: Buffer): void {
-    this.circularBuffer.push(chunk);
-    this.circularBufferBytes += chunk.length;
-
-    while (this.circularBufferBytes > this.maxBufferBytes) {
-      const removed = this.circularBuffer.shift();
-      if (removed) {
-        this.circularBufferBytes -= removed.length;
-      }
-    }
   }
 }

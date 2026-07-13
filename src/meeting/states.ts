@@ -20,6 +20,7 @@ const VALID_TRANSITIONS: Record<AraState, AraState[]> = {
   [AraState.PROCESSING]: [
     AraState.SPEAKING,
     AraState.LISTENING,
+    AraState.HANDOFF,
     AraState.ERROR,
   ],
   [AraState.SPEAKING]: [
@@ -75,5 +76,9 @@ export class StateMachine extends EventEmitter {
 
   isProcessing(): boolean {
     return this._state === AraState.PROCESSING;
+  }
+
+  isHandoff(): boolean {
+    return this._state === AraState.HANDOFF;
   }
 }
