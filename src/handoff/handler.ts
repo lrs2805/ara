@@ -22,7 +22,11 @@ export class HandoffHandler extends EventEmitter {
     );
   }
 
-  /** Check transcript text for handoff triggers. Sprint 1: log only. */
+  /**
+   * Check transcript text for handoff triggers.
+   * Live path: AraSession calls this on Realtime input transcripts.
+   * Transfer itself remains a stub (emit + HANDOFF state).
+   */
   checkTranscript(text: string): boolean {
     const lower = text.toLowerCase();
     for (const trigger of this.triggers) {

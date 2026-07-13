@@ -5,6 +5,7 @@ import {
   OPENAI_RESPONSE_TIMEOUT_MS,
   OPENAI_TTFT_TIMEOUT_MS,
 } from "../config/types.js";
+import { ConversationMemory } from "./conversation-memory.js";
 
 const REALTIME_MODEL = "gpt-realtime";
 const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
@@ -12,9 +13,15 @@ const REALTIME_URL = `wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`;
 export interface RealtimeEvents {
   audioDelta: (pcm24k: Buffer) => void;
   responseDone: () => void;
+  /** Final ASR of committed user audio (when input transcription is enabled). */
+  inputTranscript: (text: string) => void;
+  /** Final model audio transcript for the current response. */
+  outputTranscript: (text: string) => void;
   error: (err: Error) => void;
   connected: () => void;
   disconnected: () => void;
+  /** Fired after a reconnect finished replaying conversation memory. */
+  sessionRestored: (turnCount: number) => void;
 }
 
 export declare interface RealtimeClient {
@@ -32,6 +39,7 @@ export interface RealtimeOptions {
   apiKey: string;
   instructions: string;
   voice: string;
+  memory?: ConversationMemory;
 }
 
 export class RealtimeClient extends EventEmitter {
@@ -39,6 +47,7 @@ export class RealtimeClient extends EventEmitter {
   private readonly apiKey: string;
   private instructions: string;
   private voice: string;
+  private readonly memory: ConversationMemory;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private ttftTimer: ReturnType<typeof setTimeout> | null = null;
   private responseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -46,12 +55,20 @@ export class RealtimeClient extends EventEmitter {
   private destroyed = false;
   private connecting = false;
   private awaitingFirstAudio = false;
+  /** True once the first successful session was configured (reconnects replay memory). */
+  private hadSession = false;
+  private assistantTranscriptParts: string[] = [];
 
   constructor(options: RealtimeOptions) {
     super();
     this.apiKey = options.apiKey;
     this.instructions = options.instructions;
     this.voice = options.voice;
+    this.memory = options.memory ?? new ConversationMemory();
+  }
+
+  get conversationMemory(): ConversationMemory {
+    return this.memory;
   }
 
   async connect(): Promise<void> {
@@ -110,6 +127,11 @@ export class RealtimeClient extends EventEmitter {
           input: {
             format: { type: "audio/pcm", rate: 24000 },
             turn_detection: null,
+            // Opt-in ASR so handoff can match spoken triggers on user turns.
+            transcription: {
+              model: "gpt-4o-mini-transcribe",
+              language: "pt",
+            },
           },
           output: {
             format: { type: "audio/pcm", rate: 24000 },
@@ -118,6 +140,39 @@ export class RealtimeClient extends EventEmitter {
         },
       },
     });
+  }
+
+  /** Re-inject recent turns into a fresh Realtime session after reconnect. */
+  private replayConversation(): void {
+    const turns = this.memory.snapshot();
+    if (turns.length === 0) {
+      this.emit("sessionRestored", 0);
+      return;
+    }
+
+    console.log(`[OpenAI] replaying ${turns.length} conversation turns`);
+    for (const turn of turns) {
+      if (turn.role === "user") {
+        this.send({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: turn.text }],
+          },
+        });
+      } else {
+        this.send({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: turn.text }],
+          },
+        });
+      }
+    }
+    this.emit("sessionRestored", turns.length);
   }
 
   private handleMessage(data: WebSocket.RawData): void {
@@ -135,6 +190,14 @@ export class RealtimeClient extends EventEmitter {
         console.log("[OpenAI] session created");
         break;
 
+      case "session.updated":
+        if (this.hadSession) {
+          this.replayConversation();
+        } else {
+          this.hadSession = true;
+        }
+        break;
+
       case "response.output_audio.delta":
       case "response.audio.delta": {
         const delta = event.delta as string;
@@ -148,11 +211,56 @@ export class RealtimeClient extends EventEmitter {
         break;
       }
 
+      case "response.output_audio_transcript.delta":
+      case "response.audio_transcript.delta": {
+        const delta = event.delta as string | undefined;
+        if (delta) this.assistantTranscriptParts.push(delta);
+        break;
+      }
+
+      case "response.output_audio_transcript.done":
+      case "response.audio_transcript.done": {
+        const transcript =
+          (event.transcript as string | undefined)?.trim() ||
+          this.assistantTranscriptParts.join("").trim();
+        this.assistantTranscriptParts = [];
+        if (transcript) {
+          this.memory.addAssistant(transcript);
+          this.emit("outputTranscript", transcript);
+        }
+        break;
+      }
+
       case "response.done":
-      case "response.completed":
+      case "response.completed": {
+        // Flush any leftover assistant transcript if done event lacked transcript.done
+        if (this.assistantTranscriptParts.length > 0) {
+          const transcript = this.assistantTranscriptParts.join("").trim();
+          this.assistantTranscriptParts = [];
+          if (transcript) {
+            this.memory.addAssistant(transcript);
+            this.emit("outputTranscript", transcript);
+          }
+        }
         this.clearAllResponseTimers();
         this.emit("responseDone");
         break;
+      }
+
+      case "conversation.item.input_audio_transcription.completed": {
+        const transcript = event.transcript as string | undefined;
+        if (transcript?.trim()) {
+          const text = transcript.trim();
+          this.memory.addUser(text);
+          this.emit("inputTranscript", text);
+        }
+        break;
+      }
+
+      case "conversation.item.input_audio_transcription.failed": {
+        console.warn("[OpenAI] input transcription failed");
+        break;
+      }
 
       case "error": {
         const errObj = event.error as { message?: string; code?: string } | undefined;
@@ -194,6 +302,7 @@ export class RealtimeClient extends EventEmitter {
   cancelResponse(): void {
     this.send({ type: "response.cancel" });
     this.clearAllResponseTimers();
+    this.assistantTranscriptParts = [];
   }
 
   clearInputBuffer(): void {
@@ -201,6 +310,23 @@ export class RealtimeClient extends EventEmitter {
   }
 
   sendTextMessage(text: string): void {
+    this.memory.addUser(text);
+    this.send({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text }],
+      },
+    });
+    this.createResponse();
+  }
+
+  /**
+   * Ask the model to respond to an internal directive without storing it as
+   * a user conversational turn (e.g. handoff acknowledgment).
+   */
+  promptModel(text: string): void {
     this.send({
       type: "conversation.item.create",
       item: {
@@ -238,6 +364,7 @@ export class RealtimeClient extends EventEmitter {
   private startResponseTimers(): void {
     this.clearAllResponseTimers();
     this.awaitingFirstAudio = true;
+    this.assistantTranscriptParts = [];
 
     this.ttftTimer = setTimeout(() => {
       this.emit("error", new Error("OpenAI TTFT timeout (no audio)"));

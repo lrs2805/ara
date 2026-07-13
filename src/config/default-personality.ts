@@ -1,9 +1,9 @@
-import type { AraConfig } from "./types.js";
+import { AraConfigSchema, type AraConfig } from "./types.js";
 
-export const defaultConfig: AraConfig = {
+const rawDefaultConfig = {
   name: "ARA",
   voice: "alloy",
-  personality: { tone: "consultivo", speed: 1.0 },
+  personality: { tone: "consultivo" as const, speed: 1.0 },
   pitch: {
     opening:
       "Olá! Sou a ARA, assistente de vendas inteligente. Estou aqui para te ajudar a conhecer a nossa solução e responder a todas as tuas questões.",
@@ -34,3 +34,7 @@ export const defaultConfig: AraConfig = {
     ],
   },
 };
+
+/** Validated default sales personality / limits. */
+export const defaultConfig: AraConfig =
+  AraConfigSchema.parse(rawDefaultConfig);

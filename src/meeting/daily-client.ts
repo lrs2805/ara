@@ -20,6 +20,7 @@ export interface DailyClientEvents {
   left: () => void;
   participantJoined: (name: string) => void;
   trackStarted: (participant: string) => void;
+  activeSpeakerChange: (participant: string) => void;
   remoteAudio: (pcm48k: Buffer) => void;
   playbackDone: () => void;
   playbackStopped: () => void;
@@ -95,11 +96,16 @@ export class DailyClient extends EventEmitter {
         });
         console.log("[Daily] meeting token created");
       } catch (err) {
-        console.warn(
-          "[Daily] meeting token failed (joining without token):",
-          err instanceof Error ? err.message : err,
+        const message =
+          err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Daily meeting token required but creation failed: ${message}`,
         );
       }
+    } else {
+      console.warn(
+        "[Daily] no API key — joining without meeting token (dev only)",
+      );
     }
 
     // Close previous browser if reconnecting
@@ -180,6 +186,11 @@ export class DailyClient extends EventEmitter {
           case "track-started":
             if (event.participant) {
               this.emit("trackStarted", event.participant);
+            }
+            break;
+          case "active-speaker-change":
+            if (event.participant) {
+              this.emit("activeSpeakerChange", event.participant);
             }
             break;
           case "output-track-ready":
