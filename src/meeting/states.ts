@@ -29,7 +29,12 @@ const VALID_TRANSITIONS: Record<AraState, AraState[]> = {
     AraState.HANDOFF,
     AraState.ERROR,
   ],
-  [AraState.HANDOFF]: [AraState.LISTENING, AraState.IDLE, AraState.ERROR],
+  [AraState.HANDOFF]: [
+    AraState.LISTENING,
+    AraState.SPEAKING,
+    AraState.IDLE,
+    AraState.ERROR,
+  ],
   [AraState.ERROR]: [AraState.LISTENING, AraState.IDLE],
 };
 

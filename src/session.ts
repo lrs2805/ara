@@ -1,4 +1,4 @@
-import { SPEAKING_TIMEOUT_MS } from "./config/types.js";
+import { HANDOFF_HOLD_MS, SPEAKING_TIMEOUT_MS } from "./config/types.js";
 import type { AraConfig } from "./config/types.js";
 import type { RealtimeClient } from "./ai/realtime.js";
 import type { AudioBridge } from "./audio/bridge.js";
@@ -6,9 +6,11 @@ import type { HandoffHandler } from "./handoff/handler.js";
 import type { DailyClient } from "./meeting/daily-client.js";
 import { AraState, type StateMachine } from "./meeting/states.js";
 
-const HANDOFF_RESUME_MS = 2000;
 const ERROR_RECOVER_MS = 1000;
 const DAILY_ERROR_RECOVER_MS = 2000;
+
+const HANDOFF_PROMPT =
+  "O utilizador pediu para falar com um humano. Confirma em 1-2 frases em português europeu que vais transferir a chamada e pede que aguarde um momento.";
 
 export interface AraSessionDeps {
   config: AraConfig;
@@ -33,7 +35,7 @@ export class AraSession {
 
   private speakingTimer: ReturnType<typeof setTimeout> | null = null;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
-  private handoffResumeTimer: ReturnType<typeof setTimeout> | null = null;
+  private handoffHoldTimer: ReturnType<typeof setTimeout> | null = null;
   private errorRecoverTimer: ReturnType<typeof setTimeout> | null = null;
   private outputQueue: Buffer[] = [];
   private isPlayingOutput = false;
@@ -41,6 +43,8 @@ export class AraSession {
   private responseStreamDone = false;
   /** At least one TTS chunk was scheduled for this response. */
   private hasScheduledAudio = false;
+  /** True while waiting muted for a human after handoff announcement. */
+  private handoffPending = false;
   private shuttingDown = false;
   private started = false;
 
@@ -65,9 +69,13 @@ export class AraSession {
     this.realtime.on("audioDelta", (pcm24k) => this.onAudioDelta(pcm24k));
     this.realtime.on("responseDone", () => this.onResponseDone());
     this.realtime.on("inputTranscript", (text) => this.onInputTranscript(text));
+    this.realtime.on("sessionRestored", (n) => {
+      if (n > 0) console.log(`[ARA] conversation restored (${n} turns)`);
+    });
     this.realtime.on("error", (err) => this.onRealtimeError(err));
 
     this.bridge.on("speechStart", () => {
+      if (this.handoffPending) return;
       if (this.stateMachine.isSpeaking()) {
         this.interruptSpeaking("remote speech_start");
       }
@@ -92,6 +100,11 @@ export class AraSession {
 
     this.daily.on("participantJoined", (name) => {
       console.log(`[Daily] participant joined: ${name}`);
+      if (this.handoffPending) {
+        console.log(
+          `[Handoff] human may have joined (${name}) — bot stays muted`,
+        );
+      }
     });
 
     this.daily.on("trackStarted", (participant) => {
@@ -121,7 +134,7 @@ export class AraSession {
     this.shuttingDown = true;
 
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
-    if (this.handoffResumeTimer) clearTimeout(this.handoffResumeTimer);
+    if (this.handoffHoldTimer) clearTimeout(this.handoffHoldTimer);
     if (this.errorRecoverTimer) clearTimeout(this.errorRecoverTimer);
     this.clearSpeakingTimer();
 
@@ -145,7 +158,8 @@ export class AraSession {
         this.hasScheduledAudio = false;
         break;
       case AraState.SPEAKING:
-        this.bridge.setInputMode("speaking");
+        // Keep input muted during handoff announcement; otherwise enable barge-in.
+        this.bridge.setInputMode(this.handoffPending ? "muted" : "speaking");
         this.startSpeakingTimer();
         break;
       case AraState.HANDOFF:
@@ -168,7 +182,7 @@ export class AraSession {
       this.realtime.cancelResponse();
       void this.daily.stopPlayback();
       this.outputQueue = [];
-      this.stateMachine.transition(AraState.LISTENING);
+      this.finishSpeakingTurn();
     }, SPEAKING_TIMEOUT_MS);
   }
 
@@ -179,8 +193,18 @@ export class AraSession {
     }
   }
 
-  /** Enter LISTENING only after model done AND local TTS queue drained AND browser finished playing. */
-  private tryEnterListeningAfterPlayback(): void {
+  /** After TTS drains: resume LISTENING, or return to HANDOFF hold. */
+  private finishSpeakingTurn(): void {
+    this.clearSpeakingTimer();
+    if (this.handoffPending) {
+      this.stateMachine.transition(AraState.HANDOFF);
+      return;
+    }
+    this.stateMachine.transition(AraState.LISTENING);
+  }
+
+  /** Enter post-speak state only after model done AND local TTS queue drained AND browser finished playing. */
+  private tryFinishAfterPlayback(): void {
     if (!this.responseStreamDone) return;
     if (this.outputQueue.length > 0 || this.isPlayingOutput) return;
     if (!this.stateMachine.isSpeaking()) return;
@@ -190,8 +214,7 @@ export class AraSession {
       return;
     }
 
-    this.clearSpeakingTimer();
-    this.stateMachine.transition(AraState.LISTENING);
+    this.finishSpeakingTurn();
   }
 
   private async playOutputQueue(): Promise<void> {
@@ -205,7 +228,7 @@ export class AraSession {
     }
 
     this.isPlayingOutput = false;
-    this.tryEnterListeningAfterPlayback();
+    this.tryFinishAfterPlayback();
   }
 
   private interruptSpeaking(reason: string): void {
@@ -222,6 +245,12 @@ export class AraSession {
   private onAudioDelta(pcm24k: Buffer): void {
     if (this.stateMachine.state === AraState.PROCESSING) {
       this.stateMachine.transition(AraState.SPEAKING);
+    } else if (
+      this.stateMachine.state === AraState.HANDOFF &&
+      this.handoffPending
+    ) {
+      // Announcement audio after handoff trigger
+      this.stateMachine.transition(AraState.SPEAKING);
     }
     if (!this.stateMachine.isSpeaking()) return;
     this.hasScheduledAudio = true;
@@ -231,12 +260,14 @@ export class AraSession {
 
   private onResponseDone(): void {
     this.responseStreamDone = true;
-    this.tryEnterListeningAfterPlayback();
+    this.tryFinishAfterPlayback();
   }
 
   private onInputTranscript(text: string): void {
     console.log(`[ARA] user transcript: ${text}`);
-    if (this.stateMachine.state === AraState.HANDOFF) return;
+    if (this.handoffPending || this.stateMachine.state === AraState.HANDOFF) {
+      return;
+    }
     this.handoff.checkTranscript(text);
   }
 
@@ -249,12 +280,15 @@ export class AraSession {
     if (this.stateMachine.transition(AraState.ERROR)) {
       if (this.errorRecoverTimer) clearTimeout(this.errorRecoverTimer);
       this.errorRecoverTimer = setTimeout(() => {
+        this.handoffPending = false;
         this.stateMachine.transition(AraState.LISTENING);
       }, ERROR_RECOVER_MS);
     }
   }
 
   private onUtterance(pcm24k: Buffer): void {
+    if (this.handoffPending) return;
+
     if (this.stateMachine.isSpeaking()) {
       this.interruptSpeaking("remote utterance during speak");
     }
@@ -275,8 +309,7 @@ export class AraSession {
     if (!this.responseStreamDone) return;
     if (this.outputQueue.length > 0 || this.isPlayingOutput) return;
     if (!this.stateMachine.isSpeaking()) return;
-    this.clearSpeakingTimer();
-    this.stateMachine.transition(AraState.LISTENING);
+    this.finishSpeakingTurn();
   }
 
   private onDailyError(err: Error): void {
@@ -285,6 +318,7 @@ export class AraSession {
       if (this.errorRecoverTimer) clearTimeout(this.errorRecoverTimer);
       this.errorRecoverTimer = setTimeout(() => {
         if (this.stateMachine.state === AraState.ERROR) {
+          this.handoffPending = false;
           this.stateMachine.transition(AraState.LISTENING);
         }
       }, DAILY_ERROR_RECOVER_MS);
@@ -292,8 +326,10 @@ export class AraSession {
   }
 
   private onHandoffTriggered(trigger: string, transcript?: string): void {
+    if (this.handoffPending) return;
+
     console.log(
-      `[Handoff] would transfer to human (trigger: ${trigger}${transcript ? `, transcript: "${transcript}"` : ""})`,
+      `[Handoff] transferring (trigger: ${trigger}${transcript ? `, transcript: "${transcript}"` : ""})`,
     );
 
     this.realtime.cancelResponse();
@@ -303,14 +339,31 @@ export class AraSession {
     this.clearSpeakingTimer();
     void this.daily.stopPlayback();
 
+    this.handoffPending = true;
     if (!this.stateMachine.transition(AraState.HANDOFF)) {
+      // Try from current state via ERROR path is worse; force soft hold anyway
+      this.handoffPending = false;
       return;
     }
 
-    // Sprint 1 stub: acknowledge pause, then resume listening until real transfer exists.
-    if (this.handoffResumeTimer) clearTimeout(this.handoffResumeTimer);
-    this.handoffResumeTimer = setTimeout(() => {
-      this.stateMachine.transition(AraState.LISTENING);
-    }, HANDOFF_RESUME_MS);
+    // Speak a short acknowledgment, then stay muted waiting for a human.
+    this.realtime.promptModel(HANDOFF_PROMPT);
+
+    if (this.handoffHoldTimer) clearTimeout(this.handoffHoldTimer);
+    this.handoffHoldTimer = setTimeout(() => {
+      console.log(
+        "[Handoff] no human transfer completed — soft resume listening",
+      );
+      this.handoffPending = false;
+      if (
+        this.stateMachine.state === AraState.HANDOFF ||
+        this.stateMachine.state === AraState.SPEAKING
+      ) {
+        this.realtime.cancelResponse();
+        void this.daily.stopPlayback();
+        this.outputQueue = [];
+        this.stateMachine.transition(AraState.LISTENING);
+      }
+    }, HANDOFF_HOLD_MS);
   }
 }

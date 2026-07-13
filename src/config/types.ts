@@ -52,8 +52,11 @@ export const SAMPLE_RATES = {
   openai: 24000,
 } as const;
 
-export const VAD_SILENCE_MS = 1500;
+/** End-of-utterance silence before committing speech (lower = snappier replies). */
+export const VAD_SILENCE_MS = 700;
 export const SPEAKING_TIMEOUT_MS = 60_000;
+/** How long to stay muted in HANDOFF waiting for a human before soft-resume. */
+export const HANDOFF_HOLD_MS = 120_000;
 /** Time-to-first-audio timeout — cleared when first audio delta arrives. */
 export const OPENAI_TTFT_TIMEOUT_MS = 10_000;
 /** Absolute max for a single model response stream. */

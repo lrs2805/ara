@@ -23,6 +23,14 @@ describe("StateMachine", () => {
     expect(sm.isHandoff()).toBe(true);
   });
 
+  it("allows HANDOFF → SPEAKING for transfer acknowledgment", () => {
+    const sm = new StateMachine();
+    sm.transition(AraState.LISTENING);
+    sm.transition(AraState.HANDOFF);
+    expect(sm.transition(AraState.SPEAKING)).toBe(true);
+    expect(sm.transition(AraState.HANDOFF)).toBe(true);
+  });
+
   it("rejects invalid transitions", () => {
     const sm = new StateMachine();
     expect(sm.transition(AraState.SPEAKING)).toBe(false);

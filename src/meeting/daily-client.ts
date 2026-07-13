@@ -20,6 +20,7 @@ export interface DailyClientEvents {
   left: () => void;
   participantJoined: (name: string) => void;
   trackStarted: (participant: string) => void;
+  activeSpeakerChange: (participant: string) => void;
   remoteAudio: (pcm48k: Buffer) => void;
   playbackDone: () => void;
   playbackStopped: () => void;
@@ -185,6 +186,11 @@ export class DailyClient extends EventEmitter {
           case "track-started":
             if (event.participant) {
               this.emit("trackStarted", event.participant);
+            }
+            break;
+          case "active-speaker-change":
+            if (event.participant) {
+              this.emit("activeSpeakerChange", event.participant);
             }
             break;
           case "output-track-ready":

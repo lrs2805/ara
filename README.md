@@ -17,8 +17,10 @@ Open your Daily room in a browser, speak, and ARA responds by audio.
 ## Architecture
 
 ```
-Daily Room → Puppeteer/daily-js → Audio Bridge → VAD (Silero) → GPT-4o Realtime → Daily Room
+Daily Room → Puppeteer/daily-js (vendored) → AudioWorklet Bridge → VAD (Silero) → GPT Realtime → Daily Room
 ```
+
+Active-speaker gating prefers the current Daily active speaker when multiple remotes are present. OpenAI reconnects replay recent conversation turns from memory.
 
 ## Environment Variables
 
@@ -58,7 +60,7 @@ Requires `.env` file with API keys.
 IDLE → LISTENING → PROCESSING → SPEAKING → LISTENING
                   ↘ ERROR → LISTENING
 SPEAKING + interruption → LISTENING
-* → HANDOFF → LISTENING (stub transfer; triggered by user ASR keywords)
+* → HANDOFF → (announce) → SPEAKING → HANDOFF hold → LISTENING if no human
 ```
 
 ## Validation Test
