@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { createMeetingToken } from "./daily-api.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BOT_PAGE = join(__dirname, "../../public/bot-page.html");
@@ -10,6 +11,7 @@ const BOT_PAGE = join(__dirname, "../../public/bot-page.html");
 export interface DailyClientOptions {
   roomUrl: string;
   userName: string;
+  apiKey?: string;
   chromePath?: string;
 }
 
@@ -19,6 +21,8 @@ export interface DailyClientEvents {
   participantJoined: (name: string) => void;
   trackStarted: (participant: string) => void;
   remoteAudio: (pcm48k: Buffer) => void;
+  playbackDone: () => void;
+  playbackStopped: () => void;
   error: (err: Error) => void;
 }
 
@@ -69,6 +73,8 @@ export class DailyClient extends EventEmitter {
   private readonly options: DailyClientOptions;
   private reconnectAttempts = 0;
   private readonly maxReconnects = 3;
+  private intentionalDisconnect = false;
+  private functionsExposed = false;
 
   constructor(options: DailyClientOptions) {
     super();
@@ -76,7 +82,33 @@ export class DailyClient extends EventEmitter {
   }
 
   async connect(): Promise<void> {
+    this.intentionalDisconnect = false;
     const chromePath = resolveChromePath(this.options.chromePath);
+
+    let token: string | undefined;
+    if (this.options.apiKey) {
+      try {
+        token = await createMeetingToken({
+          apiKey: this.options.apiKey,
+          roomUrl: this.options.roomUrl,
+          userName: this.options.userName,
+        });
+        console.log("[Daily] meeting token created");
+      } catch (err) {
+        console.warn(
+          "[Daily] meeting token failed (joining without token):",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+
+    // Close previous browser if reconnecting
+    if (this.browser) {
+      await this.browser.close().catch(() => {});
+      this.browser = null;
+      this.page = null;
+      this.functionsExposed = false;
+    }
 
     this.browser = await puppeteer.launch({
       executablePath: chromePath,
@@ -95,19 +127,39 @@ export class DailyClient extends EventEmitter {
     });
 
     this.browser.on("disconnected", () => {
+      if (this.intentionalDisconnect) return;
       console.warn("[Daily] browser disconnected");
       this.handleDisconnect();
     });
 
     this.page = await this.browser.newPage();
+    await this.exposeBridgeFunctions();
 
-    await this.page.exposeFunction(
-      "__araOnRemoteAudio",
-      (base64: string) => {
-        const pcm = Buffer.from(base64, "base64");
-        this.emit("remoteAudio", pcm);
+    await this.page.goto(`file://${BOT_PAGE}`, { waitUntil: "networkidle0" });
+
+    await this.page.evaluate(
+      (config: { roomUrl: string; userName: string; token?: string }) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const bot = (globalThis as any).__araBot;
+        return bot.initBot(config);
+      },
+      {
+        roomUrl: this.options.roomUrl,
+        userName: this.options.userName,
+        token,
       },
     );
+
+    console.log(`[Daily] joined room as ${this.options.userName}`);
+  }
+
+  private async exposeBridgeFunctions(): Promise<void> {
+    if (!this.page || this.functionsExposed) return;
+
+    await this.page.exposeFunction("__araOnRemoteAudio", (base64: string) => {
+      const pcm = Buffer.from(base64, "base64");
+      this.emit("remoteAudio", pcm);
+    });
 
     await this.page.exposeFunction(
       "__araOnEvent",
@@ -133,6 +185,12 @@ export class DailyClient extends EventEmitter {
           case "output-track-ready":
             console.log("[Daily] output track ready");
             break;
+          case "playback-done":
+            this.emit("playbackDone");
+            break;
+          case "playback-stopped":
+            this.emit("playbackStopped");
+            break;
           case "error":
             this.emit("error", new Error(event.message ?? "Daily error"));
             break;
@@ -140,30 +198,31 @@ export class DailyClient extends EventEmitter {
       },
     );
 
-    await this.page.goto(`file://${BOT_PAGE}`, { waitUntil: "networkidle0" });
-
-    await this.page.evaluate(
-      (config: { roomUrl: string; userName: string }) => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const bot = (globalThis as any).__araBot;
-        return bot.initBot(config);
-      },
-      { roomUrl: this.options.roomUrl, userName: this.options.userName },
-    );
-
-    console.log(`[Daily] joined room as ${this.options.userName}`);
+    this.functionsExposed = true;
   }
 
-  async publishAudio(pcm48k: Buffer): Promise<void> {
-    if (!this.page) return;
+  async publishAudio(pcm48k: Buffer): Promise<{ remainingSec: number }> {
+    if (!this.page) return { remainingSec: 0 };
     const base64 = pcm48k.toString("base64");
-    await this.page.evaluate((b64: string) => {
+    const result = await this.page.evaluate((b64: string) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return (globalThis as any).__araBot.publishAudio(b64);
     }, base64);
+    return (result as { remainingSec: number }) ?? { remainingSec: 0 };
+  }
+
+  async stopPlayback(): Promise<void> {
+    if (!this.page) return;
+    await this.page
+      .evaluate(() => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (globalThis as any).__araBot.stopPlayback();
+      })
+      .catch(() => {});
   }
 
   async disconnect(): Promise<void> {
+    this.intentionalDisconnect = true;
     if (this.page) {
       await this.page
         .evaluate(() => {
@@ -172,12 +231,15 @@ export class DailyClient extends EventEmitter {
         })
         .catch(() => {});
     }
-    await this.browser?.close();
+    await this.browser?.close().catch(() => {});
     this.browser = null;
     this.page = null;
+    this.functionsExposed = false;
   }
 
   private async handleDisconnect(): Promise<void> {
+    if (this.intentionalDisconnect) return;
+
     if (this.reconnectAttempts >= this.maxReconnects) {
       this.emit("error", new Error("Daily reconnect limit exceeded"));
       return;

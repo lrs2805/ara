@@ -50,8 +50,11 @@ export const SAMPLE_RATES = {
   openai: 24000,
 } as const;
 
-export const BUFFER_MS = 200;
+export const BUFFER_MS = 50;
 export const VAD_SILENCE_MS = 1500;
-export const SPEAKING_TIMEOUT_MS = 30_000;
-export const OPENAI_TIMEOUT_MS = 10_000;
+export const SPEAKING_TIMEOUT_MS = 60_000;
+/** Time-to-first-audio timeout — cleared when first audio delta arrives. */
+export const OPENAI_TTFT_TIMEOUT_MS = 10_000;
+/** Absolute max for a single model response stream. */
+export const OPENAI_RESPONSE_TIMEOUT_MS = 60_000;
 export const OPENAI_RECONNECT_MS = 55 * 60 * 1000;

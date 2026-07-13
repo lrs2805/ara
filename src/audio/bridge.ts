@@ -19,12 +19,20 @@ export declare interface AudioBridge {
   ): boolean;
 }
 
+/**
+ * Input modes:
+ * - listening: full VAD (speech start + end → utterance)
+ * - speaking: VAD stays on for barge-in (speechStart only triggers interrupt upstream)
+ * - muted: ignore remote audio (PROCESSING)
+ */
+export type BridgeInputMode = "listening" | "speaking" | "muted";
+
 export class AudioBridge extends EventEmitter {
   private vad: VoiceActivityDetector;
   private circularBuffer: Buffer[] = [];
   private circularBufferBytes = 0;
   private readonly maxBufferBytes: number;
-  private inputEnabled = true;
+  private mode: BridgeInputMode = "listening";
 
   constructor(options: { debugAudio?: boolean } = {}) {
     super();
@@ -38,7 +46,8 @@ export class AudioBridge extends EventEmitter {
         this.emit("speechStart");
       },
       onSpeechEnd: (utterance16k) => {
-        if (!this.inputEnabled) return;
+        // During SPEAKING barge-in, still accept the interrupting utterance
+        if (this.mode === "muted") return;
         const pcm24k = resamplePcm16(
           utterance16k,
           SAMPLE_RATES.vad,
@@ -55,7 +64,7 @@ export class AudioBridge extends EventEmitter {
 
   /** Receive PCM16 48kHz chunk from Daily browser bridge. */
   ingestRemoteAudio(pcm48k: Buffer): void {
-    if (!this.inputEnabled) return;
+    if (this.mode === "muted") return;
 
     this.pushCircular(pcm48k);
     this.vad.process(pcm48k, SAMPLE_RATES.daily);
@@ -66,13 +75,19 @@ export class AudioBridge extends EventEmitter {
     return resamplePcm16(pcm24k, SAMPLE_RATES.openai, SAMPLE_RATES.daily);
   }
 
-  setInputEnabled(enabled: boolean): void {
-    this.inputEnabled = enabled;
+  setInputMode(mode: BridgeInputMode): void {
+    this.mode = mode;
+    const enabled = mode !== "muted";
     this.vad.setEnabled(enabled);
     if (!enabled) {
       this.circularBuffer = [];
       this.circularBufferBytes = 0;
     }
+  }
+
+  /** @deprecated Prefer setInputMode */
+  setInputEnabled(enabled: boolean): void {
+    this.setInputMode(enabled ? "listening" : "muted");
   }
 
   destroy(): void {

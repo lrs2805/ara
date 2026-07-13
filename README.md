@@ -69,6 +69,6 @@ SPEAKING + interruption → LISTENING
 
 - Node.js 22 + TypeScript
 - Daily.co (Puppeteer + daily-js)
-- OpenAI GPT-4o Realtime API
+- OpenAI Realtime API (`gpt-realtime`)
 - Silero VAD (avr-vad)
 - Docker (Chrome + xvfb + pulseaudio)

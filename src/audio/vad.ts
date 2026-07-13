@@ -18,6 +18,7 @@ const FRAME_MS = (FRAME_SAMPLES / SAMPLE_RATES.vad) * 1000;
 export class VoiceActivityDetector {
   private vad: RealTimeVAD | null = null;
   private enabled = true;
+  private leftover: Float32Array = new Float32Array(0);
   private readonly silenceMs: number;
   private readonly debugAudio: boolean;
   private readonly onSpeechStart?: () => void;
@@ -62,6 +63,9 @@ export class VoiceActivityDetector {
 
   setEnabled(enabled: boolean): void {
     this.enabled = enabled;
+    if (!enabled) {
+      this.leftover = new Float32Array(0);
+    }
   }
 
   /** Process PCM16 audio at the given sample rate (typically 48kHz from Daily). */
@@ -71,18 +75,24 @@ export class VoiceActivityDetector {
     const pcm16k = resamplePcm16(pcm48k, inputRate, SAMPLE_RATES.vad);
     const float32 = pcm16ToFloat32(pcm16k);
 
-    // Feed in frame-sized chunks for reliable VAD processing
-    for (let i = 0; i < float32.length; i += FRAME_SAMPLES) {
-      const frame = float32.subarray(i, i + FRAME_SAMPLES);
-      if (frame.length === FRAME_SAMPLES) {
-        this.vad.processAudio(frame);
-      }
+    const merged = new Float32Array(this.leftover.length + float32.length);
+    merged.set(this.leftover, 0);
+    merged.set(float32, this.leftover.length);
+
+    let offset = 0;
+    while (offset + FRAME_SAMPLES <= merged.length) {
+      const frame = merged.subarray(offset, offset + FRAME_SAMPLES);
+      this.vad.processAudio(frame);
+      offset += FRAME_SAMPLES;
     }
+
+    this.leftover = merged.subarray(offset);
   }
 
   destroy(): void {
     this.vad?.destroy();
     this.vad = null;
+    this.leftover = new Float32Array(0);
   }
 
   private saveDebugWav(pcm: Buffer): void {

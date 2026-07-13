@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>ARA Bot</title>
-  <script src="https://unpkg.com/@daily-co/daily-js"></script>
+  <script src="https://unpkg.com/@daily-co/daily-js@0.83.1"></script>
 </head>
 <body>
   <div id="status">initializing...</div>
@@ -17,10 +17,18 @@
     const captureNodes = new Map();
 
     const SAMPLE_RATE = 48000;
-    const CHUNK_SAMPLES = Math.floor(SAMPLE_RATE * 0.2); // 200ms
+    // ScriptProcessor requires power-of-2 buffer size (256–16384). 2048 ≈ 42.7ms @ 48kHz.
+    const CHUNK_SAMPLES = 2048;
+
+    /** Next absolute AudioContext time for seamless TTS scheduling. */
+    let nextPlayTime = 0;
+    /** Active BufferSource nodes so barge-in can stop them. */
+    const activeSources = new Set();
+    let pendingPlaybackEnds = 0;
+    let playbackGeneration = 0;
 
     async function initBot(config) {
-      const { roomUrl, userName } = config;
+      const { roomUrl, userName, token } = config;
       document.getElementById('status').textContent = 'joining...';
 
       call = window.Daily.createCallObject({
@@ -54,23 +62,38 @@
         }
       });
 
+      call.on('track-stopped', (ev) => {
+        const sessionId = ev.participant?.session_id;
+        if (sessionId && captureNodes.has(sessionId)) {
+          const nodes = captureNodes.get(sessionId);
+          nodes.processor.disconnect();
+          nodes.source.disconnect();
+          captureNodes.delete(sessionId);
+        }
+      });
+
       call.on('error', (ev) => {
         window.__araOnEvent?.({ type: 'error', message: ev.errorMsg });
       });
 
-      await call.join({
+      const joinOpts = {
         url: roomUrl,
         userName,
         startVideoOff: true,
         startAudioOff: true,
-      });
+      };
+      if (token) joinOpts.token = token;
 
+      await call.join(joinOpts);
       await setupOutputTrack();
       return { ok: true };
     }
 
     async function setupOutputTrack() {
       audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
       outputGain = audioContext.createGain();
 
       const dest = audioContext.createMediaStreamDestination();
@@ -83,6 +106,7 @@
         audioMode: 'speech',
       });
 
+      nextPlayTime = 0;
       window.__araOnEvent?.({ type: 'output-track-ready' });
     }
 
@@ -91,26 +115,38 @@
 
       const ctx = audioContext || new AudioContext({ sampleRate: SAMPLE_RATE });
       if (!audioContext) audioContext = ctx;
+      if (ctx.state === 'suspended') await ctx.resume();
 
       const source = ctx.createMediaStreamSource(new MediaStream([track]));
       const processor = ctx.createScriptProcessor(CHUNK_SAMPLES, 1, 1);
 
-      let sampleBuffer = [];
+      const sampleBuffer = new Float32Array(CHUNK_SAMPLES * 4);
+      let sampleBufferLen = 0;
 
       processor.onaudioprocess = (e) => {
         const input = e.inputBuffer.getChannelData(0);
-        sampleBuffer.push(...input);
+        if (sampleBufferLen + input.length > sampleBuffer.length) {
+          sampleBufferLen = 0;
+        }
+        sampleBuffer.set(input, sampleBufferLen);
+        sampleBufferLen += input.length;
 
-        while (sampleBuffer.length >= CHUNK_SAMPLES) {
-          const chunk = sampleBuffer.splice(0, CHUNK_SAMPLES);
+        while (sampleBufferLen >= CHUNK_SAMPLES) {
+          const chunk = sampleBuffer.subarray(0, CHUNK_SAMPLES);
           const pcm = float32ToPcm16(chunk);
           window.__araOnRemoteAudio?.(uint8ToBase64(pcm));
+          sampleBuffer.copyWithin(0, CHUNK_SAMPLES, sampleBufferLen);
+          sampleBufferLen -= CHUNK_SAMPLES;
         }
       };
 
+      // Silent sink — required to keep ScriptProcessor running, without audible feed-through
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
       source.connect(processor);
-      processor.connect(ctx.destination);
-      captureNodes.set(sessionId, { source, processor });
+      processor.connect(mute);
+      mute.connect(ctx.destination);
+      captureNodes.set(sessionId, { source, processor, mute });
     }
 
     function uint8ToBase64(bytes) {
@@ -146,24 +182,71 @@
       return out;
     }
 
-    /** Play PCM16 48kHz audio through the custom output track. */
+    /**
+     * Schedule PCM16 48kHz audio on the AudioContext timeline.
+     * Returns remaining buffered playback seconds after this chunk.
+     */
     async function publishAudio(base64Pcm) {
-      if (!audioContext || !outputGain) return;
+      if (!audioContext || !outputGain) return { remainingSec: 0 };
+      if (audioContext.state === 'suspended') await audioContext.resume();
 
       const float32 = pcm16ToFloat32(base64Pcm);
+      if (float32.length === 0) {
+        return { remainingSec: Math.max(0, nextPlayTime - audioContext.currentTime) };
+      }
+
       const buffer = audioContext.createBuffer(1, float32.length, SAMPLE_RATE);
       buffer.copyToChannel(float32, 0);
 
       const source = audioContext.createBufferSource();
       source.buffer = buffer;
       source.connect(outputGain);
-      source.start();
+
+      const now = audioContext.currentTime;
+      const startAt = Math.max(now + 0.02, nextPlayTime);
+      source.start(startAt);
+      nextPlayTime = startAt + buffer.duration;
+
+      const generation = playbackGeneration;
+      pendingPlaybackEnds++;
+      activeSources.add(source);
+
+      source.onended = () => {
+        activeSources.delete(source);
+        if (generation !== playbackGeneration) return;
+        pendingPlaybackEnds = Math.max(0, pendingPlaybackEnds - 1);
+        if (pendingPlaybackEnds === 0 && nextPlayTime <= audioContext.currentTime + 0.05) {
+          window.__araOnEvent?.({ type: 'playback-done' });
+        }
+      };
+
+      return { remainingSec: Math.max(0, nextPlayTime - now) };
+    }
+
+    /** Stop all scheduled TTS immediately (barge-in). */
+    async function stopPlayback() {
+      playbackGeneration++;
+      for (const source of activeSources) {
+        try { source.stop(); } catch (_) {}
+        try { source.disconnect(); } catch (_) {}
+      }
+      activeSources.clear();
+      pendingPlaybackEnds = 0;
+      if (audioContext) {
+        nextPlayTime = audioContext.currentTime;
+      } else {
+        nextPlayTime = 0;
+      }
+      window.__araOnEvent?.({ type: 'playback-stopped' });
     }
 
     async function leaveRoom() {
+      await stopPlayback();
+
       for (const [, nodes] of captureNodes) {
         nodes.processor.disconnect();
         nodes.source.disconnect();
+        nodes.mute?.disconnect();
       }
       captureNodes.clear();
 
@@ -174,7 +257,7 @@
       await audioContext?.close();
     }
 
-    window.__araBot = { initBot, publishAudio, leaveRoom };
+    window.__araBot = { initBot, publishAudio, stopPlayback, leaveRoom };
   </script>
 </body>
 </html>

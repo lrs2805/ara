@@ -2,7 +2,8 @@ import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import {
   OPENAI_RECONNECT_MS,
-  OPENAI_TIMEOUT_MS,
+  OPENAI_RESPONSE_TIMEOUT_MS,
+  OPENAI_TTFT_TIMEOUT_MS,
 } from "../config/types.js";
 
 const REALTIME_MODEL = "gpt-realtime";
@@ -39,9 +40,12 @@ export class RealtimeClient extends EventEmitter {
   private instructions: string;
   private voice: string;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private ttftTimer: ReturnType<typeof setTimeout> | null = null;
   private responseTimer: ReturnType<typeof setTimeout> | null = null;
   private connected = false;
   private destroyed = false;
+  private connecting = false;
+  private awaitingFirstAudio = false;
 
   constructor(options: RealtimeOptions) {
     super();
@@ -51,7 +55,10 @@ export class RealtimeClient extends EventEmitter {
   }
 
   async connect(): Promise<void> {
-    if (this.destroyed) return;
+    if (this.destroyed || this.connecting) return;
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+
+    this.connecting = true;
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(REALTIME_URL, {
@@ -61,6 +68,7 @@ export class RealtimeClient extends EventEmitter {
       });
 
       const onOpen = () => {
+        this.connecting = false;
         this.connected = true;
         this.configureSession();
         this.scheduleReconnect();
@@ -69,6 +77,7 @@ export class RealtimeClient extends EventEmitter {
       };
 
       const onError = (err: Error) => {
+        this.connecting = false;
         if (!this.connected) reject(err);
         this.emit("error", err);
       };
@@ -78,6 +87,7 @@ export class RealtimeClient extends EventEmitter {
 
       this.ws.on("message", (data) => this.handleMessage(data));
       this.ws.on("close", () => {
+        this.connecting = false;
         this.connected = false;
         this.emit("disconnected");
         if (!this.destroyed) {
@@ -129,6 +139,10 @@ export class RealtimeClient extends EventEmitter {
       case "response.audio.delta": {
         const delta = event.delta as string;
         if (delta) {
+          if (this.awaitingFirstAudio) {
+            this.awaitingFirstAudio = false;
+            this.clearTtftTimer();
+          }
           this.emit("audioDelta", Buffer.from(delta, "base64"));
         }
         break;
@@ -136,12 +150,14 @@ export class RealtimeClient extends EventEmitter {
 
       case "response.done":
       case "response.completed":
-        this.clearResponseTimer();
+        this.clearAllResponseTimers();
         this.emit("responseDone");
         break;
 
       case "error": {
-        const errObj = event.error as { message?: string } | undefined;
+        const errObj = event.error as { message?: string; code?: string } | undefined;
+        // Ignore benign cancels when nothing is in progress
+        if (errObj?.code === "response_cancel_not_active") break;
         const err = new Error(errObj?.message ?? "OpenAI Realtime error");
         console.error("[OpenAI] error:", err.message);
         this.emit("error", err);
@@ -155,10 +171,15 @@ export class RealtimeClient extends EventEmitter {
   }
 
   appendAudio(pcm24k: Buffer): void {
-    this.send({
-      type: "input_audio_buffer.append",
-      audio: pcm24k.toString("base64"),
-    });
+    // Chunk large utterances into ~100ms slices to avoid huge WS frames
+    const sliceBytes = Math.floor((24000 * 2 * 100) / 1000); // 100ms @ 24kHz pcm16
+    for (let offset = 0; offset < pcm24k.length; offset += sliceBytes) {
+      const slice = pcm24k.subarray(offset, offset + sliceBytes);
+      this.send({
+        type: "input_audio_buffer.append",
+        audio: slice.toString("base64"),
+      });
+    }
   }
 
   commitAudio(): void {
@@ -167,12 +188,12 @@ export class RealtimeClient extends EventEmitter {
 
   createResponse(): void {
     this.send({ type: "response.create" });
-    this.startResponseTimer();
+    this.startResponseTimers();
   }
 
   cancelResponse(): void {
     this.send({ type: "response.cancel" });
-    this.clearResponseTimer();
+    this.clearAllResponseTimers();
   }
 
   clearInputBuffer(): void {
@@ -200,7 +221,7 @@ export class RealtimeClient extends EventEmitter {
   destroy(): void {
     this.destroyed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.clearResponseTimer();
+    this.clearAllResponseTimers();
     this.ws?.close();
     this.ws = null;
     this.removeAllListeners();
@@ -209,22 +230,40 @@ export class RealtimeClient extends EventEmitter {
   private send(payload: Record<string, unknown>): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload));
+    } else {
+      console.warn("[OpenAI] send dropped — socket not open:", payload.type);
     }
   }
 
-  private startResponseTimer(): void {
-    this.clearResponseTimer();
+  private startResponseTimers(): void {
+    this.clearAllResponseTimers();
+    this.awaitingFirstAudio = true;
+
+    this.ttftTimer = setTimeout(() => {
+      this.emit("error", new Error("OpenAI TTFT timeout (no audio)"));
+      this.cancelResponse();
+    }, OPENAI_TTFT_TIMEOUT_MS);
+
     this.responseTimer = setTimeout(() => {
       this.emit("error", new Error("OpenAI response timeout"));
       this.cancelResponse();
-    }, OPENAI_TIMEOUT_MS);
+    }, OPENAI_RESPONSE_TIMEOUT_MS);
   }
 
-  private clearResponseTimer(): void {
+  private clearTtftTimer(): void {
+    if (this.ttftTimer) {
+      clearTimeout(this.ttftTimer);
+      this.ttftTimer = null;
+    }
+  }
+
+  private clearAllResponseTimers(): void {
+    this.clearTtftTimer();
     if (this.responseTimer) {
       clearTimeout(this.responseTimer);
       this.responseTimer = null;
     }
+    this.awaitingFirstAudio = false;
   }
 
   private scheduleReconnect(): void {
