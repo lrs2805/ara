@@ -1,0 +1,4 @@
+{
+  "name": "ARA — AI Meeting Avatar",
+  "install": "npm ci"
+}
