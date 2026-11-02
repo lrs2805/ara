@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <title>ARA Bot</title>
-  <script src="https://unpkg.com/@daily-co/daily-js@0.83.1"></script>
+  <!-- Vendored pin of @daily-co/daily-js@0.83.1 (no CDN). -->
+  <script src="./vendor/daily-0.83.1.js"></script>
 </head>
 <body>
   <div id="status">initializing...</div>
@@ -17,8 +18,13 @@
     const captureNodes = new Map();
 
     const SAMPLE_RATE = 48000;
-    // ScriptProcessor requires power-of-2 buffer size (256–16384). 2048 ≈ 42.7ms @ 48kHz.
+    // ~42.7ms @ 48kHz — power-of-2 friendly for worklet batching
     const CHUNK_SAMPLES = 2048;
+
+    /** Prefer this remote participant's audio when multiple people speak. */
+    let activeSpeakerId = null;
+    /** Fallback when Daily has not yet reported an active speaker. */
+    let soleRemoteSessionId = null;
 
     /** Next absolute AudioContext time for seamless TTS scheduling. */
     let nextPlayTime = 0;
@@ -26,10 +32,135 @@
     const activeSources = new Set();
     let pendingPlaybackEnds = 0;
     let playbackGeneration = 0;
+    let workletReady = false;
+
+    /** Binary PCM + JSON control channel to Node (avoids CDP base64). */
+    let audioIpc = null;
+
+    const CAPTURE_WORKLET = `
+class AraCaptureProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.chunkSamples = (options.processorOptions && options.processorOptions.chunkSamples) || 2048;
+    this.buffer = new Float32Array(this.chunkSamples);
+    this.offset = 0;
+  }
+
+  process(inputs) {
+    const input = inputs[0] && inputs[0][0];
+    if (!input) return true;
+
+    let i = 0;
+    while (i < input.length) {
+      const space = this.chunkSamples - this.offset;
+      const take = Math.min(space, input.length - i);
+      this.buffer.set(input.subarray(i, i + take), this.offset);
+      this.offset += take;
+      i += take;
+
+      if (this.offset >= this.chunkSamples) {
+        const copy = this.buffer.slice(0);
+        this.port.postMessage(copy.buffer, [copy.buffer]);
+        this.buffer = new Float32Array(this.chunkSamples);
+        this.offset = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('ara-capture-processor', AraCaptureProcessor);
+`;
+
+    function emitEvent(event) {
+      if (audioIpc && audioIpc.readyState === WebSocket.OPEN) {
+        audioIpc.send(JSON.stringify(event));
+      }
+    }
+
+    function sendRemotePcm(pcmBytes) {
+      if (audioIpc && audioIpc.readyState === WebSocket.OPEN) {
+        audioIpc.send(pcmBytes);
+      }
+    }
+
+    function connectAudioIpc(port) {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+        ws.binaryType = 'arraybuffer';
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('audio IPC timeout'));
+        }, 10_000);
+
+        ws.onopen = () => {
+          clearTimeout(timer);
+          audioIpc = ws;
+          resolve(ws);
+        };
+        ws.onerror = () => {
+          clearTimeout(timer);
+          reject(new Error('audio IPC error'));
+        };
+        ws.onmessage = (ev) => {
+          if (typeof ev.data === 'string') {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg.type === 'stop-playback') {
+                void stopPlayback();
+              }
+            } catch (_) {}
+            return;
+          }
+          void publishAudioBinary(new Uint8Array(ev.data));
+        };
+      });
+    }
+
+    async function ensureAudioContext() {
+      if (!audioContext) {
+        audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+      }
+      if (audioContext.state === 'suspended') {
+        await audioContext.resume();
+      }
+      if (!workletReady) {
+        const blob = new Blob([CAPTURE_WORKLET], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        try {
+          await audioContext.audioWorklet.addModule(url);
+          workletReady = true;
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      }
+      return audioContext;
+    }
+
+    function refreshSoleRemote() {
+      if (!call) {
+        soleRemoteSessionId = null;
+        return;
+      }
+      const remoteIds = Object.values(call.participants())
+        .filter((p) => p && !p.local)
+        .map((p) => p.session_id);
+      soleRemoteSessionId = remoteIds.length === 1 ? remoteIds[0] : null;
+    }
+
+    function shouldCaptureSession(sessionId) {
+      if (activeSpeakerId) return sessionId === activeSpeakerId;
+      if (soleRemoteSessionId) return sessionId === soleRemoteSessionId;
+      // Multiple remotes, no active-speaker yet: accept all (better than silence)
+      return true;
+    }
 
     async function initBot(config) {
-      const { roomUrl, userName, token } = config;
+      const { roomUrl, userName, token, audioIpcPort } = config;
       document.getElementById('status').textContent = 'joining...';
+
+      if (audioIpcPort) {
+        await connectAudioIpc(audioIpcPort);
+      }
 
       call = window.Daily.createCallObject({
         subscribeToTracksAutomatically: true,
@@ -38,23 +169,42 @@
 
       call.on('joined-meeting', () => {
         document.getElementById('status').textContent = 'joined';
-        window.__araOnEvent?.({ type: 'joined-meeting' });
+        refreshSoleRemote();
+        emitEvent({ type: 'joined-meeting' });
       });
 
       call.on('left-meeting', () => {
-        window.__araOnEvent?.({ type: 'left-meeting' });
+        emitEvent({ type: 'left-meeting' });
       });
 
       call.on('participant-joined', (ev) => {
-        window.__araOnEvent?.({
+        refreshSoleRemote();
+        emitEvent({
           type: 'participant-joined',
           participant: ev.participant?.user_name,
+          sessionId: ev.participant?.session_id,
+        });
+      });
+
+      call.on('participant-left', () => {
+        refreshSoleRemote();
+      });
+
+      call.on('active-speaker-change', (ev) => {
+        const peerId = ev.activeSpeaker?.peerId || ev.activeSpeaker?.session_id || null;
+        const localId = call?.participants()?.local?.session_id;
+        if (peerId && peerId !== localId) {
+          activeSpeakerId = peerId;
+        }
+        emitEvent({
+          type: 'active-speaker-change',
+          participant: peerId,
         });
       });
 
       call.on('track-started', async (ev) => {
         if (!ev.participant?.local && ev.track?.kind === 'audio') {
-          window.__araOnEvent?.({
+          emitEvent({
             type: 'track-started',
             participant: ev.participant?.user_name,
           });
@@ -66,14 +216,15 @@
         const sessionId = ev.participant?.session_id;
         if (sessionId && captureNodes.has(sessionId)) {
           const nodes = captureNodes.get(sessionId);
-          nodes.processor.disconnect();
+          nodes.worklet?.disconnect();
           nodes.source.disconnect();
+          nodes.mute?.disconnect();
           captureNodes.delete(sessionId);
         }
       });
 
       call.on('error', (ev) => {
-        window.__araOnEvent?.({ type: 'error', message: ev.errorMsg });
+        emitEvent({ type: 'error', message: ev.errorMsg });
       });
 
       const joinOpts = {
@@ -90,13 +241,10 @@
     }
 
     async function setupOutputTrack() {
-      audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-      if (audioContext.state === 'suspended') {
-        await audioContext.resume();
-      }
-      outputGain = audioContext.createGain();
+      const ctx = await ensureAudioContext();
+      outputGain = ctx.createGain();
 
-      const dest = audioContext.createMediaStreamDestination();
+      const dest = ctx.createMediaStreamDestination();
       outputGain.connect(dest);
 
       customTrack = dest.stream.getAudioTracks()[0];
@@ -107,55 +255,35 @@
       });
 
       nextPlayTime = 0;
-      window.__araOnEvent?.({ type: 'output-track-ready' });
+      emitEvent({ type: 'output-track-ready' });
     }
 
     async function startCaptureRemote(sessionId, track) {
       if (captureNodes.has(sessionId)) return;
 
-      const ctx = audioContext || new AudioContext({ sampleRate: SAMPLE_RATE });
-      if (!audioContext) audioContext = ctx;
-      if (ctx.state === 'suspended') await ctx.resume();
-
+      const ctx = await ensureAudioContext();
       const source = ctx.createMediaStreamSource(new MediaStream([track]));
-      const processor = ctx.createScriptProcessor(CHUNK_SAMPLES, 1, 1);
+      const worklet = new AudioWorkletNode(ctx, 'ara-capture-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: 1,
+        processorOptions: { chunkSamples: CHUNK_SAMPLES },
+      });
 
-      const sampleBuffer = new Float32Array(CHUNK_SAMPLES * 4);
-      let sampleBufferLen = 0;
-
-      processor.onaudioprocess = (e) => {
-        const input = e.inputBuffer.getChannelData(0);
-        if (sampleBufferLen + input.length > sampleBuffer.length) {
-          sampleBufferLen = 0;
-        }
-        sampleBuffer.set(input, sampleBufferLen);
-        sampleBufferLen += input.length;
-
-        while (sampleBufferLen >= CHUNK_SAMPLES) {
-          const chunk = sampleBuffer.subarray(0, CHUNK_SAMPLES);
-          const pcm = float32ToPcm16(chunk);
-          window.__araOnRemoteAudio?.(uint8ToBase64(pcm));
-          sampleBuffer.copyWithin(0, CHUNK_SAMPLES, sampleBufferLen);
-          sampleBufferLen -= CHUNK_SAMPLES;
-        }
+      worklet.port.onmessage = (ev) => {
+        if (!shouldCaptureSession(sessionId)) return;
+        const float32 = new Float32Array(ev.data);
+        sendRemotePcm(float32ToPcm16(float32));
       };
 
-      // Silent sink — required to keep ScriptProcessor running, without audible feed-through
+      // Silent sink keeps the graph alive without audible feed-through
       const mute = ctx.createGain();
       mute.gain.value = 0;
-      source.connect(processor);
-      processor.connect(mute);
+      source.connect(worklet);
+      worklet.connect(mute);
       mute.connect(ctx.destination);
-      captureNodes.set(sessionId, { source, processor, mute });
-    }
-
-    function uint8ToBase64(bytes) {
-      let binary = '';
-      const chunkSize = 8192;
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-      }
-      return btoa(binary);
+      captureNodes.set(sessionId, { source, worklet, mute });
+      refreshSoleRemote();
     }
 
     function float32ToPcm16(float32Array) {
@@ -168,29 +296,21 @@
       return buf;
     }
 
-    function pcm16ToFloat32(base64) {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
+    function pcm16BytesToFloat32(bytes) {
       const samples = bytes.length / 2;
       const out = new Float32Array(samples);
-      const view = new DataView(bytes.buffer);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       for (let i = 0; i < samples; i++) {
         out[i] = view.getInt16(i * 2, true) / 32768;
       }
       return out;
     }
 
-    /**
-     * Schedule PCM16 48kHz audio on the AudioContext timeline.
-     * Returns remaining buffered playback seconds after this chunk.
-     */
-    async function publishAudio(base64Pcm) {
+    async function publishAudioBinary(pcmBytes) {
       if (!audioContext || !outputGain) return { remainingSec: 0 };
       if (audioContext.state === 'suspended') await audioContext.resume();
 
-      const float32 = pcm16ToFloat32(base64Pcm);
+      const float32 = pcm16BytesToFloat32(pcmBytes);
       if (float32.length === 0) {
         return { remainingSec: Math.max(0, nextPlayTime - audioContext.currentTime) };
       }
@@ -216,7 +336,7 @@
         if (generation !== playbackGeneration) return;
         pendingPlaybackEnds = Math.max(0, pendingPlaybackEnds - 1);
         if (pendingPlaybackEnds === 0 && nextPlayTime <= audioContext.currentTime + 0.05) {
-          window.__araOnEvent?.({ type: 'playback-done' });
+          emitEvent({ type: 'playback-done' });
         }
       };
 
@@ -237,14 +357,14 @@
       } else {
         nextPlayTime = 0;
       }
-      window.__araOnEvent?.({ type: 'playback-stopped' });
+      emitEvent({ type: 'playback-stopped' });
     }
 
     async function leaveRoom() {
       await stopPlayback();
 
       for (const [, nodes] of captureNodes) {
-        nodes.processor.disconnect();
+        nodes.worklet?.disconnect();
         nodes.source.disconnect();
         nodes.mute?.disconnect();
       }
@@ -255,9 +375,14 @@
       }
       await call?.leave();
       await audioContext?.close();
+      audioContext = null;
+      workletReady = false;
+
+      try { audioIpc?.close(); } catch (_) {}
+      audioIpc = null;
     }
 
-    window.__araBot = { initBot, publishAudio, stopPlayback, leaveRoom };
+    window.__araBot = { initBot, stopPlayback, leaveRoom };
   </script>
 </body>
 </html>

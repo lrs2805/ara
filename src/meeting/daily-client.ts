@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import { AudioIpcServer } from "../audio/ipc-server.js";
 import { createMeetingToken } from "./daily-api.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -20,6 +21,7 @@ export interface DailyClientEvents {
   left: () => void;
   participantJoined: (name: string) => void;
   trackStarted: (participant: string) => void;
+  activeSpeakerChange: (participant: string) => void;
   remoteAudio: (pcm48k: Buffer) => void;
   playbackDone: () => void;
   playbackStopped: () => void;
@@ -74,7 +76,8 @@ export class DailyClient extends EventEmitter {
   private reconnectAttempts = 0;
   private readonly maxReconnects = 3;
   private intentionalDisconnect = false;
-  private functionsExposed = false;
+  private audioIpc: AudioIpcServer | null = null;
+  private ipcWired = false;
 
   constructor(options: DailyClientOptions) {
     super();
@@ -95,11 +98,22 @@ export class DailyClient extends EventEmitter {
         });
         console.log("[Daily] meeting token created");
       } catch (err) {
-        console.warn(
-          "[Daily] meeting token failed (joining without token):",
-          err instanceof Error ? err.message : err,
+        const message =
+          err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Daily meeting token required but creation failed: ${message}`,
         );
       }
+    } else {
+      console.warn(
+        "[Daily] no API key — joining without meeting token (dev only)",
+      );
+    }
+
+    if (!this.audioIpc) {
+      this.audioIpc = new AudioIpcServer();
+      await this.audioIpc.listen();
+      this.wireAudioIpc();
     }
 
     // Close previous browser if reconnecting
@@ -107,7 +121,6 @@ export class DailyClient extends EventEmitter {
       await this.browser.close().catch(() => {});
       this.browser = null;
       this.page = null;
-      this.functionsExposed = false;
     }
 
     this.browser = await puppeteer.launch({
@@ -133,12 +146,24 @@ export class DailyClient extends EventEmitter {
     });
 
     this.page = await this.browser.newPage();
-    await this.exposeBridgeFunctions();
+
+    const ipcReady = new Promise<void>((resolve) => {
+      const onReady = () => {
+        this.audioIpc?.off("ready", onReady);
+        resolve();
+      };
+      this.audioIpc?.on("ready", onReady);
+    });
 
     await this.page.goto(`file://${BOT_PAGE}`, { waitUntil: "networkidle0" });
 
     await this.page.evaluate(
-      (config: { roomUrl: string; userName: string; token?: string }) => {
+      (config: {
+        roomUrl: string;
+        userName: string;
+        token?: string;
+        audioIpcPort: number;
+      }) => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const bot = (globalThis as any).__araBot;
         return bot.initBot(config);
@@ -147,78 +172,78 @@ export class DailyClient extends EventEmitter {
         roomUrl: this.options.roomUrl,
         userName: this.options.userName,
         token,
+        audioIpcPort: this.audioIpc.getPort(),
       },
     );
+
+    await Promise.race([
+      ipcReady,
+      new Promise<void>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Audio IPC connect timeout")),
+          15_000,
+        ),
+      ),
+    ]);
 
     console.log(`[Daily] joined room as ${this.options.userName}`);
   }
 
-  private async exposeBridgeFunctions(): Promise<void> {
-    if (!this.page || this.functionsExposed) return;
+  private wireAudioIpc(): void {
+    if (!this.audioIpc || this.ipcWired) return;
+    this.ipcWired = true;
 
-    await this.page.exposeFunction("__araOnRemoteAudio", (base64: string) => {
-      const pcm = Buffer.from(base64, "base64");
+    this.audioIpc.on("remoteAudio", (pcm) => {
       this.emit("remoteAudio", pcm);
     });
 
-    await this.page.exposeFunction(
-      "__araOnEvent",
-      (event: { type: string; participant?: string; message?: string }) => {
-        switch (event.type) {
-          case "joined-meeting":
-            this.reconnectAttempts = 0;
-            this.emit("joined");
-            break;
-          case "left-meeting":
-            this.emit("left");
-            break;
-          case "participant-joined":
-            if (event.participant) {
-              this.emit("participantJoined", event.participant);
-            }
-            break;
-          case "track-started":
-            if (event.participant) {
-              this.emit("trackStarted", event.participant);
-            }
-            break;
-          case "output-track-ready":
-            console.log("[Daily] output track ready");
-            break;
-          case "playback-done":
-            this.emit("playbackDone");
-            break;
-          case "playback-stopped":
-            this.emit("playbackStopped");
-            break;
-          case "error":
-            this.emit("error", new Error(event.message ?? "Daily error"));
-            break;
-        }
-      },
-    );
-
-    this.functionsExposed = true;
+    this.audioIpc.on("event", (event) => {
+      switch (event.type) {
+        case "joined-meeting":
+          this.reconnectAttempts = 0;
+          this.emit("joined");
+          break;
+        case "left-meeting":
+          this.emit("left");
+          break;
+        case "participant-joined":
+          if (event.participant) {
+            this.emit("participantJoined", event.participant);
+          }
+          break;
+        case "track-started":
+          if (event.participant) {
+            this.emit("trackStarted", event.participant);
+          }
+          break;
+        case "active-speaker-change":
+          if (event.participant) {
+            this.emit("activeSpeakerChange", event.participant);
+          }
+          break;
+        case "output-track-ready":
+          console.log("[Daily] output track ready");
+          break;
+        case "playback-done":
+          this.emit("playbackDone");
+          break;
+        case "playback-stopped":
+          this.emit("playbackStopped");
+          break;
+        case "error":
+          this.emit("error", new Error(event.message ?? "Daily error"));
+          break;
+      }
+    });
   }
 
   async publishAudio(pcm48k: Buffer): Promise<{ remainingSec: number }> {
-    if (!this.page) return { remainingSec: 0 };
-    const base64 = pcm48k.toString("base64");
-    const result = await this.page.evaluate((b64: string) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (globalThis as any).__araBot.publishAudio(b64);
-    }, base64);
-    return (result as { remainingSec: number }) ?? { remainingSec: 0 };
+    this.audioIpc?.sendPcm(pcm48k);
+    return { remainingSec: 0 };
   }
 
   async stopPlayback(): Promise<void> {
-    if (!this.page) return;
-    await this.page
-      .evaluate(() => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        return (globalThis as any).__araBot.stopPlayback();
-      })
-      .catch(() => {});
+    this.audioIpc?.stopPlayback();
   }
 
   async disconnect(): Promise<void> {
@@ -234,7 +259,9 @@ export class DailyClient extends EventEmitter {
     await this.browser?.close().catch(() => {});
     this.browser = null;
     this.page = null;
-    this.functionsExposed = false;
+    await this.audioIpc?.close();
+    this.audioIpc = null;
+    this.ipcWired = false;
   }
 
   private async handleDisconnect(): Promise<void> {
