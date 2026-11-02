@@ -55,8 +55,10 @@ export class RealtimeClient extends EventEmitter {
   private destroyed = false;
   private connecting = false;
   private awaitingFirstAudio = false;
-  /** True once the first successful session was configured (reconnects replay memory). */
+  /** True once the first successful session was configured. */
   private hadSession = false;
+  /** Set on socket close so the next session.updated replays memory once. */
+  private pendingReplay = false;
   private assistantTranscriptParts: string[] = [];
 
   constructor(options: RealtimeOptions) {
@@ -106,6 +108,7 @@ export class RealtimeClient extends EventEmitter {
       this.ws.on("close", () => {
         this.connecting = false;
         this.connected = false;
+        if (this.hadSession) this.pendingReplay = true;
         this.emit("disconnected");
         if (!this.destroyed) {
           console.log("[OpenAI] WebSocket closed, reconnecting...");
@@ -191,7 +194,10 @@ export class RealtimeClient extends EventEmitter {
         break;
 
       case "session.updated":
-        if (this.hadSession) {
+        // Only replay after a reconnect — not on every session.update (e.g. instruction tweaks).
+        if (this.pendingReplay) {
+          this.pendingReplay = false;
+          this.hadSession = true;
           this.replayConversation();
         } else {
           this.hadSession = true;
@@ -341,6 +347,7 @@ export class RealtimeClient extends EventEmitter {
   updateInstructions(instructions: string, voice?: string): void {
     this.instructions = instructions;
     if (voice) this.voice = voice;
+    // Do not set pendingReplay — mid-call instruction updates must not duplicate history.
     if (this.connected) this.configureSession();
   }
 

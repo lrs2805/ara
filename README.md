@@ -17,10 +17,10 @@ Open your Daily room in a browser, speak, and ARA responds by audio.
 ## Architecture
 
 ```
-Daily Room → Puppeteer/daily-js (vendored) → AudioWorklet Bridge → VAD (Silero) → GPT Realtime → Daily Room
+Daily Room → Puppeteer/daily-js (vendored) → AudioWorklet → localhost WS (PCM) → VAD → GPT Realtime → Daily Room
 ```
 
-Active-speaker gating prefers the current Daily active speaker when multiple remotes are present. OpenAI reconnects replay recent conversation turns from memory.
+Remote capture and TTS travel as binary PCM over a localhost WebSocket (not base64 CDP). Active-speaker gating prefers the current Daily active speaker. OpenAI reconnects replay recent conversation turns once per reconnect.
 
 ## Environment Variables
 
